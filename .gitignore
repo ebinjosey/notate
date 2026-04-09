@@ -8,3 +8,4 @@ build/
 *.md.bak
 *.txt.bak
 exports/
+.DS_Store
