@@ -3,7 +3,7 @@
 **notate** is a simple, open-source Python CLI that exports Apple Books highlights and notes from your local macOS library into clean, well-formatted output files.
 
 ## Demo
-![notatedemo-small](https://github.com/user-attachments/assets/c6f051e4-2259-476a-b385-c494b9eafd15)
+![notatedemo1](https://github.com/user-attachments/assets/d8ea8164-f441-491a-9a68-818e8b6ce302)
 
 ## Overview
 
