@@ -6,7 +6,17 @@
 
 notate provides a fast and minimal way to extract your Apple Books highlights into formats that are ready to use in tools like **Notion**, **Obsidian**, or plain text workflows. It runs entirely locally and is designed for simplicity, readability, and zero friction.
 
-## Features
+1. Shows only books that have highlights
+2. Lets you select a book by number or title text
+3. Asks for output format:
+   - `1` = Notion (`.md`)
+   - `2` = Obsidian (`.md`)
+   - `3` = Plain Text (`.txt`)
+4. Writes a clean export file with:
+   - Book title at the top
+   - Highlights grouped chapter-by-chapter
+   - Entries sorted in reading order (location-based), not creation time
+   - Files saved in `exports/`
 
 When you run notate, it:
 

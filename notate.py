@@ -22,9 +22,12 @@ from xml.etree import ElementTree
 APPLE_BOOKS_ROOT = Path("~/Library/Containers/com.apple.iBooksX/Data/Documents").expanduser()
 BKLIBRARY_DIR = APPLE_BOOKS_ROOT / "BKLibrary"
 ANNOTATION_DIR = APPLE_BOOKS_ROOT / "AEAnnotation"
+EXPORTS_DIR_NAME = "exports"
 
 CFI_SPINE_PATTERN = re.compile(r"/6/(\d+)(?:\[([^\]]+)])?")
 INT_PATTERN = re.compile(r"\d+")
+ORDERED_LIST_LEAD_PATTERN = re.compile(r"^(\d+)([.)])(\s+)")
+UNORDERED_LIST_LEAD_PATTERN = re.compile(r"^([*+-])(\s+)")
 
 
 @dataclass(frozen=True)
@@ -547,13 +550,21 @@ def format_notion(book_title: str, chapter_groups: list[ChapterGroup]) -> str:
         lines.append("")
         for h in chapter.highlights:
             if h.text:
-                lines.append(f"- {h.text}")
+                lines.append(f"- {escape_markdown_list_lead(h.text)}")
                 if h.note:
                     lines.append(f"  - Note: {h.note}")
             elif h.note:
                 lines.append(f"- Note: {h.note}")
         lines.append("")
     return "\n".join(lines).strip() + "\n"
+
+
+def escape_markdown_list_lead(text: str) -> str:
+    """Prevent nested list parsing without showing escape characters."""
+    if ORDERED_LIST_LEAD_PATTERN.match(text) or UNORDERED_LIST_LEAD_PATTERN.match(text):
+        # Invisible separator keeps rendered text unchanged while breaking list-marker parsing.
+        return "\u2060" + text
+    return text
 
 
 def format_obsidian(book_title: str, chapter_groups: list[ChapterGroup]) -> str:
@@ -644,11 +655,13 @@ def prompt_for_format() -> tuple[str, str]:
 
 def write_output_file(book_title: str, output_format: str, extension: str, content: str) -> Path:
     base = slugify(book_title)
-    candidate = Path.cwd() / f"{base}-{output_format}.{extension}"
+    exports_dir = Path.cwd() / EXPORTS_DIR_NAME
+    exports_dir.mkdir(parents=True, exist_ok=True)
+    candidate = exports_dir / f"{base}-{output_format}.{extension}"
 
     counter = 2
     while candidate.exists():
-        candidate = Path.cwd() / f"{base}-{output_format}-{counter}.{extension}"
+        candidate = exports_dir / f"{base}-{output_format}-{counter}.{extension}"
         counter += 1
 
     candidate.write_text(content, encoding="utf-8")
