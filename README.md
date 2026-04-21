@@ -1,4 +1,4 @@
-# notate
+# notate — Export Apple Books Highlights to Notion & Obsidian
 
 **notate** is a simple, open-source Python CLI that exports Apple Books highlights and notes from your local macOS library into clean, well-formatted output files.
 
