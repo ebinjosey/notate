@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import html
+import os
 import posixpath
 import re
 import sqlite3
@@ -23,11 +24,24 @@ APPLE_BOOKS_ROOT = Path("~/Library/Containers/com.apple.iBooksX/Data/Documents")
 BKLIBRARY_DIR = APPLE_BOOKS_ROOT / "BKLibrary"
 ANNOTATION_DIR = APPLE_BOOKS_ROOT / "AEAnnotation"
 EXPORTS_DIR_NAME = "exports"
+SCRIPT_ROOT = Path(__file__).resolve().parent
+
+TRUSTED_BOOK_PATH_ROOTS = (
+    APPLE_BOOKS_ROOT,
+    Path("~/Library/Mobile Documents/iCloud~com~apple~iBooks/Documents").expanduser(),
+    Path("~/Library/Containers/com.apple.BKAgentService/Data/Documents/iBooks/Books").expanduser(),
+)
+
+MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
+MAX_XML_BYTES = 2 * 1024 * 1024
+MAX_ZIP_MEMBER_BYTES = 2 * 1024 * 1024
+MAX_ZIP_EXPANSION_RATIO = 200
 
 CFI_SPINE_PATTERN = re.compile(r"/6/(\d+)(?:\[([^\]]+)])?")
 INT_PATTERN = re.compile(r"\d+")
 ORDERED_LIST_LEAD_PATTERN = re.compile(r"^(\d+)([.)])(\s+)")
 UNORDERED_LIST_LEAD_PATTERN = re.compile(r"^([*+-])(\s+)")
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 
 @dataclass(frozen=True)
@@ -69,6 +83,48 @@ class ManifestItem:
     href: str
     media_type: str
     properties: str
+
+
+def warn(message: str) -> None:
+    print(f"[notate] {message}", file=sys.stderr)
+
+
+def sanitize_terminal_text(text: str) -> str:
+    no_ansi = ANSI_ESCAPE_PATTERN.sub("", text)
+    return "".join(ch for ch in no_ansi if ch.isprintable() or ch in {" ", "\t"})
+
+
+def is_trusted_book_path(path: Path) -> bool:
+    if path.suffix.lower() != ".epub":
+        return False
+
+    try:
+        resolved_path = path.resolve(strict=False)
+    except OSError:
+        return False
+
+    for root in TRUSTED_BOOK_PATH_ROOTS:
+        try:
+            resolved_root = root.resolve(strict=False)
+        except OSError:
+            continue
+        if resolved_root in resolved_path.parents or resolved_path == resolved_root:
+            return True
+    return False
+
+
+def is_safe_relative_path(path: str) -> bool:
+    if not path:
+        return False
+    if path.startswith("/"):
+        return False
+
+    normalized = posixpath.normpath(path)
+    if normalized in {"", "."}:
+        return False
+    if normalized.startswith("../"):
+        return False
+    return True
 
 
 # ============================================================================
@@ -280,16 +336,20 @@ def load_chapter_lookup(book_path: str | None) -> dict[int, str]:
         return {}
 
     path = Path(book_path).expanduser()
+    if not is_trusted_book_path(path):
+        warn(f"Skipping untrusted book path from database: {path}")
+        return {}
     if not path.exists():
         return {}
 
-    try:
-        if path.is_dir():
-            return load_chapter_lookup_from_directory(path)
-        if path.is_file() and zipfile.is_zipfile(path):
+    if path.is_dir():
+        return load_chapter_lookup_from_directory(path)
+    if path.is_file() and zipfile.is_zipfile(path):
+        try:
             return load_chapter_lookup_from_zip(path)
-    except Exception:
-        return {}
+        except (zipfile.BadZipFile, OSError) as error:
+            warn(f"Skipping invalid EPUB archive {path}: {error}")
+            return {}
     return {}
 
 
@@ -297,15 +357,22 @@ def load_chapter_lookup_from_directory(root: Path) -> dict[int, str]:
     opf_path = find_opf_relative_path_directory(root)
     if not opf_path:
         return {}
-    opf_text = read_file_text(root / Path(opf_path))
+    if not is_safe_relative_path(opf_path):
+        warn(f"Skipping unsafe OPF path in directory EPUB: {opf_path}")
+        return {}
+    opf_text = read_file_text(root / Path(opf_path), max_bytes=MAX_XML_BYTES)
     if not opf_text:
         return {}
 
     def exists(relative_path: str) -> bool:
+        if not is_safe_relative_path(relative_path):
+            return False
         return (root / Path(relative_path)).exists()
 
     def read(relative_path: str) -> str:
-        return read_file_text(root / Path(relative_path))
+        if not is_safe_relative_path(relative_path):
+            return ""
+        return read_file_text(root / Path(relative_path), max_bytes=MAX_XML_BYTES)
 
     return chapter_lookup_from_opf(opf_path, opf_text, exists, read)
 
@@ -315,17 +382,26 @@ def load_chapter_lookup_from_zip(epub_path: Path) -> dict[int, str]:
         opf_path = find_opf_relative_path_zip(archive)
         if not opf_path:
             return {}
-        opf_text = read_zip_text(archive, opf_path)
+        if not is_safe_relative_path(opf_path):
+            warn(f"Skipping unsafe OPF path in zip EPUB: {opf_path}")
+            return {}
+        opf_text = read_zip_text(archive, opf_path, max_bytes=MAX_XML_BYTES)
         if not opf_text:
             return {}
 
-        names = set(archive.namelist())
-
         def exists(relative_path: str) -> bool:
-            return relative_path in names
+            if not is_safe_relative_path(relative_path):
+                return False
+            try:
+                archive.getinfo(relative_path)
+                return True
+            except KeyError:
+                return False
 
         def read(relative_path: str) -> str:
-            return read_zip_text(archive, relative_path)
+            if not is_safe_relative_path(relative_path):
+                return ""
+            return read_zip_text(archive, relative_path, max_bytes=MAX_XML_BYTES)
 
         return chapter_lookup_from_opf(opf_path, opf_text, exists, read)
 
@@ -467,7 +543,7 @@ def parse_nav_document(nav_text: str, opf_dir: str) -> dict[str, str]:
 def find_opf_relative_path_directory(root: Path) -> str | None:
     container_xml = root / "META-INF" / "container.xml"
     if container_xml.exists():
-        opf_path = extract_opf_path(read_file_text(container_xml))
+        opf_path = extract_opf_path(read_file_text(container_xml, max_bytes=MAX_XML_BYTES))
         if opf_path:
             return opf_path
 
@@ -478,12 +554,11 @@ def find_opf_relative_path_directory(root: Path) -> str | None:
 
 
 def find_opf_relative_path_zip(archive: zipfile.ZipFile) -> str | None:
-    try:
-        opf_path = extract_opf_path(archive.read("META-INF/container.xml").decode("utf-8", "ignore"))
+    container_xml = read_zip_text(archive, "META-INF/container.xml", max_bytes=MAX_XML_BYTES)
+    if container_xml:
+        opf_path = extract_opf_path(container_xml)
         if opf_path:
             return opf_path
-    except KeyError:
-        pass
 
     for name in archive.namelist():
         if name.lower().endswith(".opf"):
@@ -502,7 +577,10 @@ def extract_opf_path(container_xml: str) -> str | None:
     for rootfile in root.findall(".//{*}rootfile"):
         full_path = rootfile.attrib.get("full-path", "").strip()
         if full_path:
-            return posixpath.normpath(full_path)
+            normalized = posixpath.normpath(full_path)
+            if is_safe_relative_path(normalized):
+                return normalized
+            warn(f"Skipping unsafe OPF full-path in container.xml: {full_path}")
     return None
 
 
@@ -510,24 +588,58 @@ def resolve_href(base_dir: str, href: str) -> str:
     clean_href = unquote((href or "").split("#", 1)[0]).strip()
     if not clean_href:
         return ""
+
     if clean_href.startswith("/"):
-        return posixpath.normpath(clean_href.lstrip("/"))
-    if base_dir:
-        return posixpath.normpath(posixpath.join(base_dir, clean_href))
-    return posixpath.normpath(clean_href)
+        candidate = posixpath.normpath(clean_href.lstrip("/"))
+    elif base_dir:
+        candidate = posixpath.normpath(posixpath.join(base_dir, clean_href))
+    else:
+        candidate = posixpath.normpath(clean_href)
+
+    if not is_safe_relative_path(candidate):
+        return ""
+    return candidate
 
 
-def read_file_text(path: Path) -> str:
+def read_file_text(path: Path, max_bytes: int = MAX_TEXT_FILE_BYTES) -> str:
     try:
-        return path.read_bytes().decode("utf-8", errors="ignore")
+        size = path.stat().st_size
+        if size > max_bytes:
+            warn(f"Skipping oversized file ({size} bytes): {path}")
+            return ""
+
+        with path.open("rb") as file_obj:
+            data = file_obj.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            warn(f"Skipping oversized file while reading: {path}")
+            return ""
+        return data.decode("utf-8", errors="ignore")
     except OSError:
         return ""
 
 
-def read_zip_text(archive: zipfile.ZipFile, relative_path: str) -> str:
+def read_zip_text(archive: zipfile.ZipFile, relative_path: str, max_bytes: int = MAX_ZIP_MEMBER_BYTES) -> str:
     try:
-        return archive.read(relative_path).decode("utf-8", errors="ignore")
+        info = archive.getinfo(relative_path)
     except KeyError:
+        return ""
+
+    if info.file_size > max_bytes:
+        warn(f"Skipping oversized archive member ({info.file_size} bytes): {relative_path}")
+        return ""
+
+    if info.compress_size > 0 and info.file_size / info.compress_size > MAX_ZIP_EXPANSION_RATIO:
+        warn(f"Skipping high-expansion archive member: {relative_path}")
+        return ""
+
+    try:
+        with archive.open(info, "r") as file_obj:
+            data = file_obj.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            warn(f"Skipping oversized archive member while reading: {relative_path}")
+            return ""
+        return data.decode("utf-8", errors="ignore")
+    except OSError:
         return ""
 
 
@@ -608,7 +720,8 @@ def format_plain_text(book_title: str, chapter_groups: list[ChapterGroup]) -> st
 def prompt_for_book(books: list[Book]) -> Book:
     print("Books with highlights:")
     for idx, book in enumerate(books, start=1):
-        print(f"{idx}. {book.title} ({book.highlight_count} highlights)")
+        safe_title = sanitize_terminal_text(book.title)
+        print(f"{idx}. {safe_title} ({book.highlight_count} highlights)")
 
     while True:
         choice = input("\nSelect by number or title text: ").strip()
@@ -629,7 +742,7 @@ def prompt_for_book(books: list[Book]) -> Book:
         if len(matches) > 1:
             print("Multiple books match that text. Be more specific or pick a number:")
             for book in matches[:10]:
-                print(f"- {book.title}")
+                print(f"- {sanitize_terminal_text(book.title)}")
             continue
         print("No matching book found. Try again.")
 
@@ -655,17 +768,27 @@ def prompt_for_format() -> tuple[str, str]:
 
 def write_output_file(book_title: str, output_format: str, extension: str, content: str) -> Path:
     base = slugify(book_title)
-    exports_dir = Path.cwd() / EXPORTS_DIR_NAME
+    exports_dir = SCRIPT_ROOT / EXPORTS_DIR_NAME
+    if exports_dir.exists() and exports_dir.is_symlink():
+        raise RuntimeError(f"Refusing to write to symlinked exports directory: {exports_dir}")
+
     exports_dir.mkdir(parents=True, exist_ok=True)
-    candidate = exports_dir / f"{base}-{output_format}.{extension}"
+    if exports_dir.is_symlink():
+        raise RuntimeError(f"Refusing to write to symlinked exports directory: {exports_dir}")
 
-    counter = 2
-    while candidate.exists():
-        candidate = exports_dir / f"{base}-{output_format}-{counter}.{extension}"
-        counter += 1
-
-    candidate.write_text(content, encoding="utf-8")
-    return candidate
+    counter = 1
+    data = content.encode("utf-8")
+    while True:
+        candidate = exports_dir / f"{base}-{output_format}.{extension}"
+        if counter > 1:
+            candidate = exports_dir / f"{base}-{output_format}-{counter}.{extension}"
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            with os.fdopen(fd, "wb") as output_file:
+                output_file.write(data)
+            return candidate
+        except FileExistsError:
+            counter += 1
 
 
 def slugify(text: str) -> str:
